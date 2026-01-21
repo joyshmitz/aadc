@@ -229,13 +229,17 @@ aadc [OPTIONS] [FILE]
 
 | Argument | Description |
 |----------|-------------|
-| `[FILE]` | Input file. Reads from stdin if not provided. |
+| `[FILE]` | Input file or directory. Reads from stdin if not provided (directories require `--recursive`). |
 
 ### Options
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--in-place` | `-i` | false | Edit file in place (requires FILE) |
+| `--recursive` | `-r` | false | Process files recursively in directories |
+| `--glob` |  | `*.txt,*.md` | Glob pattern for recursive mode (comma-separated) |
+| `--no-gitignore` |  | false | Do not respect `.gitignore` when recursing |
+| `--max-depth` |  | 0 | Maximum directory depth (0 = unlimited) |
 | `--max-iters` | `-m` | 10 | Maximum correction iterations per block |
 | `--min-score` | `-s` | 0.5 | Minimum confidence score (0.0-1.0) for applying edits |
 | `--tab-width` | `-t` | 4 | Tab expansion width in spaces |
@@ -285,6 +289,28 @@ aadc --tab-width 2 diagram.txt
 
 # Combine options
 aadc -i -v --max-iters 20 --min-score 0.4 diagram.txt
+```
+
+### Recursive Mode
+
+Process entire directory trees:
+
+```bash
+# All .txt and .md files (default patterns)
+aadc -r docs/
+
+# Custom glob patterns
+aadc -r --glob "*.md" docs/
+aadc -r --glob "*.txt,*.md,*.rst" .
+
+# In-place recursive edit
+aadc -ri docs/
+
+# Limit depth
+aadc -r --max-depth 2 docs/
+
+# Include gitignored files
+aadc -r --no-gitignore vendor/
 ```
 
 ---

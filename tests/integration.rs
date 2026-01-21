@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use tempfile::TempDir;
 
 /// Test logging macro - prints when TEST_VERBOSE is set
 macro_rules! test_log {
@@ -108,6 +109,22 @@ fn run_aadc_file(file_path: &str, args: &[&str]) -> (String, String, i32) {
     let code = output.status.code().unwrap_or(-1);
 
     test_log!("OUTPUT", "Exit code: {}", code);
+
+    (stdout, stderr, code)
+}
+
+fn run_aadc_args(args: &[&str]) -> (String, String, i32) {
+    test_log!("RUN", "aadc with args: {:?}", args);
+
+    let binary = get_binary_path();
+    let output = Command::new(&binary)
+        .args(args)
+        .output()
+        .expect("Failed to run aadc");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
 
     (stdout, stderr, code)
 }
@@ -235,6 +252,65 @@ fn test_e2e_min_score_threshold() {
     // Very high threshold should reject more revisions
     let (_stdout_high, _stderr, code) = run_aadc_stdin(input, &["--min-score", "0.99"]);
     assert_eq!(code, 0, "High threshold should succeed");
+
+    test_log!("END", "Test PASSED");
+}
+
+// ============================================================================
+// Recursive Mode Tests
+// ============================================================================
+
+#[test]
+fn test_e2e_recursive_in_place() {
+    test_log!("START", "Recursive in-place processing");
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+
+    let input = "+---+\n| a|\n+---+\n";
+    fs::write(root.join("a.md"), input).unwrap();
+    fs::write(nested.join("b.md"), input).unwrap();
+
+    let dir_arg = root.to_str().unwrap();
+    let (_stdout, _stderr, code) = run_aadc_args(&["-r", "-i", "--glob", "*.md", dir_arg]);
+
+    assert_eq!(code, 0, "Should exit successfully");
+
+    let a_contents = fs::read_to_string(root.join("a.md")).unwrap();
+    let b_contents = fs::read_to_string(nested.join("b.md")).unwrap();
+    assert!(a_contents.contains("| a |"));
+    assert!(b_contents.contains("| a |"));
+
+    test_log!("END", "Test PASSED");
+}
+
+#[test]
+fn test_e2e_recursive_respects_gitignore() {
+    test_log!("START", "Recursive mode respects .gitignore by default");
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+
+    let input = "+---+\n| a|\n+---+\n";
+    fs::write(root.join("included.md"), input).unwrap();
+    fs::write(root.join("ignored.md"), input).unwrap();
+
+    let dir_arg = root.to_str().unwrap();
+    let (_stdout, _stderr, code) = run_aadc_args(&["-r", "-i", "--glob", "*.md", dir_arg]);
+
+    assert_eq!(code, 0, "Should exit successfully");
+
+    let included = fs::read_to_string(root.join("included.md")).unwrap();
+    let ignored = fs::read_to_string(root.join("ignored.md")).unwrap();
+    assert!(included.contains("| a |"), "Included file should be fixed");
+    assert!(
+        ignored.contains("| a|"),
+        "Ignored file should remain unchanged"
+    );
 
     test_log!("END", "Test PASSED");
 }

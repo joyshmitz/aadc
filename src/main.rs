@@ -48,9 +48,9 @@
 #![warn(missing_docs)]
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use clap::ValueEnum;
 use clap::error::ErrorKind;
+use clap::{Parser, Subcommand};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use rich_rust::Console;
@@ -280,6 +280,10 @@ struct Config {
     preset: Option<Preset>,
     tab_width: usize,
     all_blocks: bool,
+    recursive: bool,
+    glob: String,
+    gitignore: bool,
+    max_depth: usize,
     verbose: bool,
     diff: bool,
     dry_run: bool,
@@ -296,6 +300,10 @@ impl From<&Args> for Config {
             preset: args.preset,
             tab_width: args.tab_width,
             all_blocks: args.all,
+            recursive: args.recursive,
+            glob: args.glob.clone(),
+            gitignore: !args.no_gitignore,
+            max_depth: args.max_depth,
             verbose: args.verbose,
             diff: args.diff,
             dry_run: args.dry_run,
@@ -330,6 +338,10 @@ fn validate_args(args: &Args) -> Result<()> {
 
     if args.in_place && args.inputs.is_empty() {
         return Err(ArgError("--in-place requires at least one input file".to_string()).into());
+    }
+
+    if args.recursive && args.inputs.is_empty() {
+        return Err(ArgError("--recursive requires at least one input path".to_string()).into());
     }
 
     Ok(())
@@ -1150,6 +1162,95 @@ fn correct_lines(lines: Vec<String>, config: &Config, console: &Console) -> (Vec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Recursive File Discovery
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_globset(patterns: &str) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0;
+
+    for raw in patterns.split(',') {
+        let pattern = raw.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+
+        let glob = Glob::new(pattern)
+            .map_err(|err| ArgError(format!("Invalid glob pattern '{}': {}", pattern, err)))?;
+        builder.add(glob);
+        added += 1;
+    }
+
+    if added == 0 {
+        return Err(ArgError("--glob must include at least one pattern".to_string()).into());
+    }
+
+    builder
+        .build()
+        .map_err(|err| ArgError(format!("Invalid glob set: {}", err)).into())
+}
+
+fn discover_recursive_files(
+    paths: &[PathBuf],
+    config: &Config,
+    console: &Console,
+) -> Result<Vec<PathBuf>> {
+    let globs = build_globset(&config.glob)?;
+    let mut files = std::collections::BTreeSet::new();
+
+    for path in paths {
+        if path.is_file() {
+            files.insert(path.clone());
+            continue;
+        }
+
+        if !path.is_dir() {
+            if config.verbose {
+                console.print(&format!(
+                    "[dim]Warning: path does not exist: {}[/]",
+                    path.display()
+                ));
+            }
+            continue;
+        }
+
+        let mut walker = WalkBuilder::new(path);
+        walker.git_ignore(config.gitignore);
+        walker.git_exclude(config.gitignore);
+        walker.git_global(config.gitignore);
+        walker.ignore(config.gitignore);
+        walker.hidden(false);
+
+        if config.max_depth > 0 {
+            walker.max_depth(Some(config.max_depth));
+        }
+
+        for entry in walker.build() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if config.verbose {
+                        console.print(&format!("[dim]Warning: {}[/]", err));
+                    }
+                    continue;
+                }
+            };
+
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                if let Some(name) = entry_path.file_name() {
+                    if globs.is_match(name) {
+                        files.insert(entry_path.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(files.into_iter().collect())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Backup
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1372,8 +1473,9 @@ fn hook_install(check_only: bool, auto_fix: bool, patterns: Option<&[String]>) -
 
     // Create hooks directory if it doesn't exist
     if !hooks_dir.exists() {
-        fs::create_dir_all(&hooks_dir)
-            .with_context(|| format!("Failed to create hooks directory: {}", hooks_dir.display()))?;
+        fs::create_dir_all(&hooks_dir).with_context(|| {
+            format!("Failed to create hooks directory: {}", hooks_dir.display())
+        })?;
     }
 
     // Check for existing hook
@@ -1427,11 +1529,7 @@ fn hook_install(check_only: bool, auto_fix: bool, patterns: Option<&[String]>) -
             .with_context(|| format!("Failed to make hook executable: {}", hook_path.display()))?;
     }
 
-    let mode = if auto_fix {
-        "auto-fix"
-    } else {
-        "check"
-    };
+    let mode = if auto_fix { "auto-fix" } else { "check" };
     println!(
         "Installed aadc pre-commit hook ({} mode): {}",
         mode,
@@ -1473,7 +1571,11 @@ fn hook_uninstall() -> Result<()> {
             "Note: Previous hook backup exists at: {}",
             backup_path.display()
         );
-        println!("Restore it manually with: mv {} {}", backup_path.display(), hook_path.display());
+        println!(
+            "Restore it manually with: mv {} {}",
+            backup_path.display(),
+            hook_path.display()
+        );
     }
 
     Ok(())
@@ -1663,6 +1765,27 @@ fn run(args: Args) -> Result<RunOutcome> {
         }
     }
 
+    if config.recursive {
+        let files = discover_recursive_files(&args.inputs, &config, &console)?;
+        if files.is_empty() {
+            let message = format!(
+                "Warning: No files matched pattern '{}' in provided paths",
+                config.glob
+            );
+            if config.verbose {
+                console.print(&format!("[dim]{}[/]", message));
+            } else {
+                eprintln!("{}", message);
+            }
+            return Ok(RunOutcome {
+                dry_run: config.dry_run,
+                would_change: false,
+            });
+        }
+
+        return output_multiple_results(&args, &config, &console, &files);
+    }
+
     // Determine if we're processing stdin or files
     if args.inputs.is_empty() {
         // Stdin mode - single input
@@ -1677,7 +1800,7 @@ fn run(args: Args) -> Result<RunOutcome> {
         output_single_result(&args, &config, &console, result)
     } else {
         // Multiple file mode
-        output_multiple_results(&args, &config, &console)
+        output_multiple_results(&args, &config, &console, &args.inputs)
     }
 }
 
@@ -1831,7 +1954,12 @@ fn output_dry_run_single(config: &Config, console: &Console, result: &FileResult
 }
 
 /// Handle output for multiple files
-fn output_multiple_results(args: &Args, config: &Config, console: &Console) -> Result<RunOutcome> {
+fn output_multiple_results(
+    args: &Args,
+    config: &Config,
+    console: &Console,
+    paths: &[PathBuf],
+) -> Result<RunOutcome> {
     let mut total_files_processed = 0;
     let mut total_files_changed = 0;
     let mut total_blocks_modified = 0;
@@ -1839,9 +1967,9 @@ fn output_multiple_results(args: &Args, config: &Config, console: &Console) -> R
     let mut any_would_change = false;
     let mut errors: Vec<(PathBuf, anyhow::Error)> = Vec::new();
 
-    let show_file_headers = !args.in_place && !config.diff && !config.json && args.inputs.len() > 1;
+    let show_file_headers = !args.in_place && !config.diff && !config.json && paths.len() > 1;
 
-    for path in &args.inputs {
+    for path in paths {
         match read_file(path) {
             Ok(lines) => {
                 let result = process_input(lines, path.display().to_string(), config, console);
@@ -1916,7 +2044,7 @@ fn output_multiple_results(args: &Args, config: &Config, console: &Console) -> R
     }
 
     // Print summary for multiple files in verbose mode
-    if config.verbose && args.inputs.len() > 1 {
+    if config.verbose && paths.len() > 1 {
         console.print(&format!(
             "\n[bold]Summary:[/] {} file(s) processed, {} changed, {} block(s), {} revision(s), {} error(s)",
             total_files_processed, total_files_changed, total_blocks_modified, total_revisions, errors.len()
@@ -1963,6 +2091,10 @@ mod tests {
     fn make_args() -> Args {
         Args {
             inputs: vec![],
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            no_gitignore: false,
+            max_depth: 0,
             in_place: false,
             preset: None,
             max_iters: 10,
@@ -1975,6 +2107,7 @@ mod tests {
             backup: false,
             backup_ext: ".bak".to_string(),
             json: false,
+            command: None,
         }
     }
 
@@ -1986,6 +2119,10 @@ mod tests {
     fn test_args_defaults() {
         let args = Args::parse_from(["aadc"]);
         assert!(args.inputs.is_empty());
+        assert!(!args.recursive);
+        assert_eq!(args.glob, "*.txt,*.md");
+        assert!(!args.no_gitignore);
+        assert_eq!(args.max_depth, 0);
         assert!(!args.in_place);
         assert!(args.preset.is_none());
         assert_eq!(args.max_iters, 10);
@@ -2036,6 +2173,34 @@ mod tests {
     }
 
     #[test]
+    fn test_args_recursive_defaults() {
+        let args = Args::parse_from(["aadc", "-r", "docs"]);
+        assert!(args.recursive);
+        assert_eq!(args.glob, "*.txt,*.md");
+        assert!(!args.no_gitignore);
+        assert_eq!(args.max_depth, 0);
+        assert_eq!(args.inputs, vec![PathBuf::from("docs")]);
+    }
+
+    #[test]
+    fn test_args_recursive_custom() {
+        let args = Args::parse_from([
+            "aadc",
+            "--recursive",
+            "--glob",
+            "*.md",
+            "--max-depth",
+            "2",
+            "--no-gitignore",
+            "docs",
+        ]);
+        assert!(args.recursive);
+        assert_eq!(args.glob, "*.md");
+        assert!(args.no_gitignore);
+        assert_eq!(args.max_depth, 2);
+    }
+
+    #[test]
     fn test_args_preset_long() {
         let args = Args::parse_from(["aadc", "--preset", "strict", "file.txt"]);
         assert_eq!(args.inputs, vec![PathBuf::from("file.txt")]);
@@ -2075,6 +2240,10 @@ mod tests {
             preset: Some(Preset::Strict),
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -2093,6 +2262,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -2129,6 +2302,15 @@ mod tests {
         args.in_place = true;
         assert!(validate_args(&args).is_err());
         args.inputs = vec![PathBuf::from("diagram.txt")];
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn test_validate_args_recursive_requires_path() {
+        let mut args = make_args();
+        args.recursive = true;
+        assert!(validate_args(&args).is_err());
+        args.inputs = vec![PathBuf::from("docs")];
         assert!(validate_args(&args).is_ok());
     }
 
@@ -2357,6 +2539,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -2381,6 +2567,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: true,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -2393,6 +2583,126 @@ mod tests {
 
         assert_ne!(corrected, lines);
         assert_eq!(corrected[0], "    Plain text");
+    }
+
+    // =========================================================================
+    // Recursive discovery tests
+    // =========================================================================
+
+    #[test]
+    fn test_discover_recursive_files_glob_matching() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), "content").unwrap();
+        fs::write(temp.path().join("b.md"), "content").unwrap();
+        fs::write(temp.path().join("c.rs"), "content").unwrap();
+
+        let config = Config {
+            max_iters: 10,
+            min_score: 0.5,
+            preset: None,
+            tab_width: 4,
+            all_blocks: false,
+            recursive: true,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: false,
+            max_depth: 0,
+            verbose: false,
+            diff: false,
+            dry_run: false,
+            backup: false,
+            backup_ext: ".bak".to_string(),
+            json: false,
+        };
+        let console = Console::new();
+
+        let files =
+            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"b.md"));
+        assert!(!names.contains(&"c.rs"));
+    }
+
+    #[test]
+    fn test_discover_recursive_files_max_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("a/b")).unwrap();
+        fs::write(temp.path().join("top.txt"), "").unwrap();
+        fs::write(temp.path().join("a/mid.txt"), "").unwrap();
+        fs::write(temp.path().join("a/b/deep.txt"), "").unwrap();
+
+        let config = Config {
+            max_iters: 10,
+            min_score: 0.5,
+            preset: None,
+            tab_width: 4,
+            all_blocks: false,
+            recursive: true,
+            glob: "*.txt".to_string(),
+            gitignore: false,
+            max_depth: 2,
+            verbose: false,
+            diff: false,
+            dry_run: false,
+            backup: false,
+            backup_ext: ".bak".to_string(),
+            json: false,
+        };
+        let console = Console::new();
+
+        let files =
+            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(names.contains(&"top.txt"));
+        assert!(names.contains(&"mid.txt"));
+        assert!(!names.contains(&"deep.txt"));
+    }
+
+    #[test]
+    fn test_discover_recursive_files_respects_gitignore() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(temp.path().join("included.txt"), "").unwrap();
+        fs::write(temp.path().join("ignored.txt"), "").unwrap();
+
+        fs::create_dir(temp.path().join(".git")).unwrap();
+
+        let config = Config {
+            max_iters: 10,
+            min_score: 0.5,
+            preset: None,
+            tab_width: 4,
+            all_blocks: false,
+            recursive: true,
+            glob: "*.txt".to_string(),
+            gitignore: true,
+            max_depth: 0,
+            verbose: false,
+            diff: false,
+            dry_run: false,
+            backup: false,
+            backup_ext: ".bak".to_string(),
+            json: false,
+        };
+        let console = Console::new();
+
+        let files =
+            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+
+        assert!(names.contains(&"included.txt"));
+        assert!(!names.contains(&"ignored.txt"));
     }
 
     // =========================================================================
@@ -3409,6 +3719,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3456,6 +3770,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3484,6 +3802,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3513,6 +3835,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3543,6 +3869,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3571,6 +3901,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3601,6 +3935,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3630,6 +3968,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3665,6 +4007,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
@@ -3688,6 +4034,10 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
             verbose: false,
             diff: false,
             dry_run: false,
