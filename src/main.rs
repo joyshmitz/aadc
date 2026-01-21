@@ -61,6 +61,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Exit Codes
@@ -123,6 +124,131 @@ fn exit_code_for_error(err: &anyhow::Error) -> i32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Line Range Processing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A range of lines to process (1-indexed, inclusive on both ends)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineRange {
+    /// Start line (1-indexed, inclusive)
+    start: usize,
+    /// End line (1-indexed, inclusive, usize::MAX means "to end of file")
+    end: usize,
+}
+
+/// Parse a single range specification like "10-50", "50-", "-100", or "42"
+fn parse_single_range(s: &str) -> Result<LineRange, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("Empty range specification".to_string());
+    }
+
+    if let Some(dash_pos) = s.find('-') {
+        let (start_str, end_str) = s.split_at(dash_pos);
+        let end_str = &end_str[1..]; // Skip the dash
+
+        let start = if start_str.is_empty() {
+            1 // "-100" means "1-100"
+        } else {
+            start_str
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid start line: '{}'", start_str))?
+        };
+
+        let end = if end_str.is_empty() {
+            usize::MAX // "50-" means "50 to end"
+        } else {
+            end_str
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid end line: '{}'", end_str))?
+        };
+
+        if start == 0 {
+            return Err("Line numbers start at 1, not 0".to_string());
+        }
+
+        if start > end && end != usize::MAX {
+            return Err(format!(
+                "Invalid range: start ({}) > end ({})",
+                start, end
+            ));
+        }
+
+        Ok(LineRange { start, end })
+    } else {
+        // Single line number
+        let line = s
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid line number: '{}'", s))?;
+
+        if line == 0 {
+            return Err("Line numbers start at 1, not 0".to_string());
+        }
+
+        Ok(LineRange {
+            start: line,
+            end: line,
+        })
+    }
+}
+
+/// Merge overlapping or adjacent ranges
+fn merge_ranges(mut ranges: Vec<LineRange>) -> Vec<LineRange> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    // Sort by start position
+    ranges.sort_by_key(|r| r.start);
+
+    let mut merged = Vec::new();
+    let mut current = ranges[0].clone();
+
+    for range in ranges.into_iter().skip(1) {
+        // Check if overlapping or adjacent (allowing for +1 to merge adjacent)
+        if range.start <= current.end.saturating_add(1) {
+            // Merge: extend current range
+            current.end = current.end.max(range.end);
+        } else {
+            // No overlap: push current and start new
+            merged.push(current);
+            current = range;
+        }
+    }
+    merged.push(current);
+
+    merged
+}
+
+/// Parse a line ranges specification like "10-50", "1-100,200-250", "50-"
+fn parse_line_ranges(s: &str) -> Result<Vec<LineRange>, String> {
+    let mut ranges = Vec::new();
+
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        ranges.push(parse_single_range(part)?);
+    }
+
+    if ranges.is_empty() {
+        return Err("No valid ranges specified".to_string());
+    }
+
+    // Merge overlapping ranges
+    Ok(merge_ranges(ranges))
+}
+
+/// Check if a line number (1-indexed) falls within any of the given ranges
+#[allow(dead_code)]
+fn line_in_ranges(line_num: usize, ranges: &[LineRange]) -> bool {
+    ranges
+        .iter()
+        .any(|r| line_num >= r.start && line_num <= r.end)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CLI Arguments
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -150,7 +276,8 @@ impl Preset {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum ColorMode {
     /// Auto-detect color support
     Auto,
@@ -222,6 +349,10 @@ struct Args {
     /// Process all diagram-like blocks, not just confident ones
     #[arg(short = 'a', long)]
     all: bool,
+
+    /// Process only specific line ranges (e.g., "10-50", "1-100,200-250", "50-", "-100")
+    #[arg(short = 'L', long, value_name = "RANGES")]
+    lines: Option<String>,
 
     /// Verbose output showing correction progress
     #[arg(short = 'v', long)]
@@ -318,12 +449,14 @@ enum HookAction {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Runtime configuration derived from CLI args
+#[derive(Debug)]
 struct Config {
     max_iters: usize,
     min_score: f64,
     preset: Option<Preset>,
     tab_width: usize,
     all_blocks: bool,
+    lines: Option<Vec<LineRange>>,
     recursive: bool,
     glob: String,
     gitignore: bool,
@@ -339,12 +472,16 @@ struct Config {
 
 impl From<&Args> for Config {
     fn from(args: &Args) -> Self {
+        // Parse line ranges if provided
+        let lines = args.lines.as_ref().and_then(|s| parse_line_ranges(s).ok());
+
         Self {
             max_iters: args.max_iters,
             min_score: args.min_score,
             preset: args.preset,
             tab_width: args.tab_width,
             all_blocks: args.all,
+            lines,
             recursive: args.recursive,
             glob: args.glob.clone(),
             gitignore: !args.no_gitignore,
@@ -1538,6 +1675,50 @@ fn expand_tabs(line: &str, tab_width: usize) -> String {
     result
 }
 
+/// Check if a block overlaps with any of the given line ranges
+/// Block indices are 0-indexed, ranges are 1-indexed
+fn block_overlaps_ranges(block: &DiagramBlock, ranges: &[LineRange]) -> bool {
+    // Convert block to 1-indexed for comparison with ranges
+    let block_start = block.start + 1;
+    let block_end = block.end; // end is already exclusive, so it's effectively 1-indexed
+
+    ranges.iter().any(|r| {
+        // Check if block and range overlap
+        block_start <= r.end && block_end >= r.start
+    })
+}
+
+/// Format line ranges for display
+fn format_line_ranges(ranges: &[LineRange], total_lines: usize) -> String {
+    let range_strs: Vec<String> = ranges
+        .iter()
+        .map(|r| {
+            if r.end == usize::MAX {
+                format!("{}-", r.start)
+            } else if r.start == r.end {
+                format!("{}", r.start)
+            } else {
+                format!("{}-{}", r.start, r.end)
+            }
+        })
+        .collect();
+
+    // Calculate how many lines are covered
+    let covered: usize = ranges
+        .iter()
+        .map(|r| {
+            let effective_end = r.end.min(total_lines);
+            if r.start <= effective_end {
+                effective_end - r.start + 1
+            } else {
+                0
+            }
+        })
+        .sum();
+
+    format!("{} ({} of {} lines)", range_strs.join(", "), covered, total_lines)
+}
+
 /// Main correction entry point
 fn correct_lines(
     lines: Vec<String>,
@@ -1546,6 +1727,20 @@ fn correct_lines(
     styles: &VerboseStyle,
 ) -> (Vec<String>, Stats) {
     let mut stats = Stats::default();
+    let total_lines = lines.len();
+
+    // Show line range info in verbose mode
+    if config.verbose {
+        if let Some(ref ranges) = config.lines {
+            console.print(&format!(
+                "{}",
+                styles.header(format!(
+                    "Line ranges: {}",
+                    format_line_ranges(ranges, total_lines)
+                ))
+            ));
+        }
+    }
 
     if !config.all_blocks {
         let scan = quick_scan_for_diagrams(&lines);
@@ -1588,6 +1783,24 @@ fn correct_lines(
 
     // Correct each block
     for (i, block) in blocks.iter().enumerate() {
+        // Check if block overlaps with line ranges (if specified)
+        if let Some(ref ranges) = config.lines {
+            if !block_overlaps_ranges(block, ranges) {
+                if config.verbose {
+                    console.print(&format!(
+                        "{}",
+                        styles.dim(format!(
+                            "  Block {}: lines {}-{} (skipped: outside line ranges)",
+                            i + 1,
+                            block.start + 1,
+                            block.end
+                        ))
+                    ));
+                }
+                continue;
+            }
+        }
+
         if config.verbose {
             console.print(&format!(
                 "{}",
@@ -2446,7 +2659,7 @@ fn output_multiple_results(
     for path in paths {
         match read_file(path) {
             Ok(lines) => {
-                let result = process_input(lines, path.display().to_string(), config, console);
+                let result = process_input(lines, path.display().to_string(), config, console, styles);
 
                 if result.would_change {
                     any_would_change = true;
@@ -2595,6 +2808,7 @@ mod tests {
             min_score: 0.5,
             tab_width: 4,
             all: false,
+            lines: None, // String, not Vec<LineRange>
             verbose: false,
             color: ColorMode::Auto,
             diff: false,
@@ -2604,6 +2818,34 @@ mod tests {
             json: false,
             command: None,
         }
+    }
+
+    /// Create a default Config for tests
+    fn make_test_config() -> Config {
+        Config {
+            max_iters: 10,
+            min_score: 0.5,
+            preset: None,
+            tab_width: 4,
+            all_blocks: false,
+            lines: None,
+            recursive: false,
+            glob: "*.txt,*.md".to_string(),
+            gitignore: true,
+            max_depth: 0,
+            color: ColorMode::Auto,
+            verbose: false,
+            diff: false,
+            dry_run: false,
+            backup: false,
+            backup_ext: ".bak".to_string(),
+            json: false,
+        }
+    }
+
+    /// Create VerboseStyle for tests (no colors)
+    fn make_test_styles() -> VerboseStyle {
+        VerboseStyle::new(false)
     }
 
     // =========================================================================
@@ -2736,6 +2978,7 @@ mod tests {
             preset: Some(Preset::Strict),
             tab_width: 4,
             all_blocks: false,
+            lines: None,
             recursive: false,
             glob: "*.txt,*.md".to_string(),
             gitignore: true,
@@ -2759,6 +3002,7 @@ mod tests {
             preset: None,
             tab_width: 4,
             all_blocks: false,
+            lines: None,
             recursive: false,
             glob: "*.txt,*.md".to_string(),
             gitignore: true,
@@ -3031,25 +3275,10 @@ mod tests {
     #[test]
     fn test_correct_lines_passthrough_skips_tabs() {
         let lines = vec!["\tPlain text".to_string()];
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
         let console = Console::new();
-        let (corrected, stats) = correct_lines(lines.clone(), &config, &console);
+        let styles = make_test_styles();
+        let (corrected, stats) = correct_lines(lines.clone(), &config, &console, &styles);
 
         assert_eq!(corrected, lines);
         assert_eq!(stats.blocks_found, 0);
@@ -3059,25 +3288,11 @@ mod tests {
     #[test]
     fn test_correct_lines_all_blocks_bypasses_quick_scan() {
         let lines = vec!["\tPlain text".to_string()];
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: true,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let mut config = make_test_config();
+        config.all_blocks = true;
         let console = Console::new();
-        let (corrected, _stats) = correct_lines(lines.clone(), &config, &console);
+        let styles = make_test_styles();
+        let (corrected, _stats) = correct_lines(lines.clone(), &config, &console, &styles);
 
         assert_ne!(corrected, lines);
         assert_eq!(corrected[0], "    Plain text");
@@ -3094,27 +3309,15 @@ mod tests {
         fs::write(temp.path().join("b.md"), "content").unwrap();
         fs::write(temp.path().join("c.rs"), "content").unwrap();
 
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: true,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: false,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let mut config = make_test_config();
+        config.recursive = true;
+        config.gitignore = false;
         let console = Console::new();
+        let styles = make_test_styles();
 
         let files =
-            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console).unwrap();
+            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console, &styles)
+                .unwrap();
         let names: Vec<_> = files
             .iter()
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
@@ -3133,27 +3336,17 @@ mod tests {
         fs::write(temp.path().join("a/mid.txt"), "").unwrap();
         fs::write(temp.path().join("a/b/deep.txt"), "").unwrap();
 
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: true,
-            glob: "*.txt".to_string(),
-            gitignore: false,
-            max_depth: 2,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let mut config = make_test_config();
+        config.recursive = true;
+        config.glob = "*.txt".to_string();
+        config.gitignore = false;
+        config.max_depth = 2;
         let console = Console::new();
+        let styles = make_test_styles();
 
         let files =
-            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console).unwrap();
+            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console, &styles)
+                .unwrap();
         let names: Vec<_> = files
             .iter()
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
@@ -3173,27 +3366,15 @@ mod tests {
 
         fs::create_dir(temp.path().join(".git")).unwrap();
 
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: true,
-            glob: "*.txt".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let mut config = make_test_config();
+        config.recursive = true;
+        config.glob = "*.txt".to_string();
         let console = Console::new();
+        let styles = make_test_styles();
 
         let files =
-            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console).unwrap();
+            discover_recursive_files(&[temp.path().to_path_buf()], &config, &console, &styles)
+                .unwrap();
         let names: Vec<_> = files
             .iter()
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
@@ -4211,23 +4392,8 @@ mod tests {
     #[test]
     fn test_correction_simple() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "+------+".to_string(),
@@ -4236,7 +4402,7 @@ mod tests {
             "+------+".to_string(),
         ];
 
-        let (corrected, stats) = correct_lines(lines, &config, &console);
+        let (corrected, stats) = correct_lines(lines, &config, &console, &styles);
 
         // Should find and process the block
         assert_eq!(stats.blocks_found, 1);
@@ -4262,30 +4428,15 @@ mod tests {
     #[test]
     fn test_correction_no_diagrams() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "Just plain text".to_string(),
             "No diagrams here".to_string(),
         ];
 
-        let (corrected, stats) = correct_lines(lines.clone(), &config, &console);
+        let (corrected, stats) = correct_lines(lines.clone(), &config, &console, &styles);
         assert_eq!(stats.blocks_found, 0);
         assert_eq!(stats.blocks_modified, 0);
         assert_eq!(corrected, lines, "content should be unchanged");
@@ -4294,23 +4445,8 @@ mod tests {
     #[test]
     fn test_correction_already_aligned() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "+------+".to_string(),
@@ -4318,7 +4454,7 @@ mod tests {
             "+------+".to_string(),
         ];
 
-        let (corrected, stats) = correct_lines(lines.clone(), &config, &console);
+        let (corrected, stats) = correct_lines(lines.clone(), &config, &console, &styles);
         assert_eq!(stats.blocks_found, 1);
         // Perfectly aligned blocks should not be modified
         assert_eq!(corrected, lines);
@@ -4327,23 +4463,8 @@ mod tests {
     #[test]
     fn test_correction_unicode() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "┌───────┐".to_string(),
@@ -4352,7 +4473,7 @@ mod tests {
             "└───────┘".to_string(),
         ];
 
-        let (corrected, stats) = correct_lines(lines, &config, &console);
+        let (corrected, stats) = correct_lines(lines, &config, &console, &styles);
         assert_eq!(stats.blocks_found, 1);
         // Verify correction ran successfully (at least one block found and processed)
         assert!(!corrected.is_empty());
@@ -4361,23 +4482,8 @@ mod tests {
     #[test]
     fn test_correction_with_tabs() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "+------+".to_string(),
@@ -4385,7 +4491,7 @@ mod tests {
             "+------+".to_string(),
         ];
 
-        let (corrected, _) = correct_lines(lines, &config, &console);
+        let (corrected, _) = correct_lines(lines, &config, &console, &styles);
         // Tab should be expanded to spaces
         assert!(!corrected[1].contains('\t'), "tabs should be expanded");
     }
@@ -4393,23 +4499,10 @@ mod tests {
     #[test]
     fn test_correction_max_iters_limit() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 1, // Only 1 iteration
-            min_score: 0.1,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let mut config = make_test_config();
+        config.max_iters = 1; // Only 1 iteration
+        config.min_score = 0.1;
+        let styles = make_test_styles();
 
         let lines = vec![
             "+--------+".to_string(),
@@ -4418,7 +4511,7 @@ mod tests {
             "+--------+".to_string(),
         ];
 
-        let (corrected, stats) = correct_lines(lines, &config, &console);
+        let (corrected, stats) = correct_lines(lines, &config, &console, &styles);
         assert_eq!(stats.blocks_found, 1);
         // With limited iterations, some progress should still be made
         assert!(corrected.len() == 4);
@@ -4427,23 +4520,9 @@ mod tests {
     #[test]
     fn test_correction_min_score_filter() {
         let console = Console::new();
-        let config_strict = Config {
-            max_iters: 10,
-            min_score: 0.95, // Very strict
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let mut config = make_test_config();
+        config.min_score = 0.95; // Very strict
+        let styles = make_test_styles();
 
         let lines = vec![
             "+------+".to_string(),
@@ -4451,7 +4530,7 @@ mod tests {
             "+------+".to_string(),
         ];
 
-        let (corrected, _) = correct_lines(lines.clone(), &config_strict, &console);
+        let (corrected, _) = correct_lines(lines.clone(), &config, &console, &styles);
         // With very strict min_score, fewer changes should be made
         // The exact behavior depends on the scoring implementation
         assert!(corrected.len() == 3);
@@ -4460,23 +4539,8 @@ mod tests {
     #[test]
     fn test_correction_multiple_blocks() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "+--+".to_string(),
@@ -4491,7 +4555,7 @@ mod tests {
             "+--+".to_string(),
         ];
 
-        let (corrected, stats) = correct_lines(lines, &config, &console);
+        let (corrected, stats) = correct_lines(lines, &config, &console, &styles);
         assert_eq!(stats.blocks_found, 2, "should find two blocks");
         assert_eq!(corrected.len(), 10);
     }
@@ -4499,26 +4563,11 @@ mod tests {
     #[test]
     fn test_correction_empty_input() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines: Vec<String> = vec![];
-        let (corrected, stats) = correct_lines(lines, &config, &console);
+        let (corrected, stats) = correct_lines(lines, &config, &console, &styles);
         assert_eq!(stats.blocks_found, 0);
         assert!(corrected.is_empty());
     }
@@ -4526,23 +4575,8 @@ mod tests {
     #[test]
     fn test_correction_preserves_non_diagram_content() {
         let console = Console::new();
-        let config = Config {
-            max_iters: 10,
-            min_score: 0.5,
-            preset: None,
-            tab_width: 4,
-            all_blocks: false,
-            recursive: false,
-            glob: "*.txt,*.md".to_string(),
-            gitignore: true,
-            max_depth: 0,
-            verbose: false,
-            diff: false,
-            dry_run: false,
-            backup: false,
-            backup_ext: ".bak".to_string(),
-            json: false,
-        };
+        let config = make_test_config();
+        let styles = make_test_styles();
 
         let lines = vec![
             "# Header".to_string(),
@@ -4554,7 +4588,7 @@ mod tests {
             "Footer text".to_string(),
         ];
 
-        let (corrected, _) = correct_lines(lines, &config, &console);
+        let (corrected, _) = correct_lines(lines, &config, &console, &styles);
         assert_eq!(corrected[0], "# Header");
         assert_eq!(corrected[6], "Footer text");
     }
@@ -5244,5 +5278,234 @@ verbose = true
     fn test_args_no_config_option() {
         let args = Args::parse_from(["aadc", "--no-config"]);
         assert!(args.no_config);
+    }
+
+    // =========================================================================
+    // Line range parsing tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_simple_range() {
+        let ranges = parse_line_ranges("10-50").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 10);
+        assert_eq!(ranges[0].end, 50);
+    }
+
+    #[test]
+    fn test_parse_multiple_ranges() {
+        let ranges = parse_line_ranges("1-10, 20-30, 50-60").unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], LineRange { start: 1, end: 10 });
+        assert_eq!(ranges[1], LineRange { start: 20, end: 30 });
+        assert_eq!(ranges[2], LineRange { start: 50, end: 60 });
+    }
+
+    #[test]
+    fn test_parse_open_ended_start() {
+        let ranges = parse_line_ranges("50-").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 50);
+        assert_eq!(ranges[0].end, usize::MAX);
+    }
+
+    #[test]
+    fn test_parse_open_ended_end() {
+        let ranges = parse_line_ranges("-100").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 1);
+        assert_eq!(ranges[0].end, 100);
+    }
+
+    #[test]
+    fn test_parse_single_line() {
+        let ranges = parse_line_ranges("42").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 42);
+        assert_eq!(ranges[0].end, 42);
+    }
+
+    #[test]
+    fn test_merge_overlapping_ranges() {
+        let ranges = parse_line_ranges("1-50, 40-100").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 1);
+        assert_eq!(ranges[0].end, 100);
+    }
+
+    #[test]
+    fn test_merge_adjacent_ranges() {
+        let ranges = parse_line_ranges("1-10, 11-20").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 1);
+        assert_eq!(ranges[0].end, 20);
+    }
+
+    #[test]
+    fn test_invalid_range_reversed() {
+        let result = parse_line_ranges("50-10");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("start (50) > end (10)"));
+    }
+
+    #[test]
+    fn test_invalid_range_non_numeric() {
+        let result = parse_line_ranges("abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid line number"));
+    }
+
+    #[test]
+    fn test_invalid_range_zero() {
+        let result = parse_line_ranges("0-10");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Line numbers start at 1"));
+    }
+
+    #[test]
+    fn test_line_in_ranges() {
+        let ranges = vec![
+            LineRange { start: 1, end: 10 },
+            LineRange { start: 20, end: 30 },
+        ];
+        assert!(line_in_ranges(5, &ranges));
+        assert!(line_in_ranges(1, &ranges));
+        assert!(line_in_ranges(10, &ranges));
+        assert!(line_in_ranges(25, &ranges));
+        assert!(!line_in_ranges(15, &ranges));
+        assert!(!line_in_ranges(31, &ranges));
+    }
+
+    #[test]
+    fn test_block_overlaps_ranges() {
+        let ranges = vec![LineRange { start: 10, end: 20 }];
+
+        // Block fully inside range
+        let block_inside = DiagramBlock {
+            start: 11, // 0-indexed, so line 12
+            end: 15,   // exclusive, so through line 15
+            confidence: 1.0,
+        };
+        assert!(block_overlaps_ranges(&block_inside, &ranges));
+
+        // Block overlapping start of range
+        let block_overlap_start = DiagramBlock {
+            start: 5,
+            end: 12,
+            confidence: 1.0,
+        };
+        assert!(block_overlaps_ranges(&block_overlap_start, &ranges));
+
+        // Block overlapping end of range
+        let block_overlap_end = DiagramBlock {
+            start: 18,
+            end: 25,
+            confidence: 1.0,
+        };
+        assert!(block_overlaps_ranges(&block_overlap_end, &ranges));
+
+        // Block completely outside range
+        let block_outside = DiagramBlock {
+            start: 25,
+            end: 30,
+            confidence: 1.0,
+        };
+        assert!(!block_overlaps_ranges(&block_outside, &ranges));
+    }
+
+    #[test]
+    fn test_format_line_ranges() {
+        let ranges = vec![
+            LineRange { start: 1, end: 10 },
+            LineRange { start: 20, end: 30 },
+        ];
+        let formatted = format_line_ranges(&ranges, 100);
+        assert!(formatted.contains("1-10"));
+        assert!(formatted.contains("20-30"));
+        assert!(formatted.contains("21 of 100 lines"));
+    }
+
+    #[test]
+    fn test_format_line_ranges_open_ended() {
+        let ranges = vec![LineRange { start: 50, end: usize::MAX }];
+        let formatted = format_line_ranges(&ranges, 100);
+        assert!(formatted.contains("50-"));
+        assert!(formatted.contains("51 of 100 lines"));
+    }
+
+    #[test]
+    fn test_args_lines_parsing() {
+        let args = Args::parse_from(["aadc", "--lines", "10-50", "file.txt"]);
+        assert!(args.lines.is_some());
+        assert_eq!(args.lines.as_ref().unwrap(), "10-50");
+
+        // Verify it parses correctly via Config
+        let config = Config::from(&args);
+        let ranges = config.lines.unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 10);
+        assert_eq!(ranges[0].end, 50);
+    }
+
+    #[test]
+    fn test_args_lines_multiple_ranges() {
+        let args = Args::parse_from(["aadc", "-L", "1-10,50-60", "file.txt"]);
+        assert!(args.lines.is_some());
+        assert_eq!(args.lines.as_ref().unwrap(), "1-10,50-60");
+
+        // Verify it parses correctly via Config
+        let config = Config::from(&args);
+        let ranges = config.lines.unwrap();
+        assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn test_correct_lines_with_ranges() {
+        // Input with two clearly separate diagrams (enough separation to detect as 2 blocks)
+        // Gap of 3+ non-boxy lines breaks block detection
+        let input = r#"+------+
+| Hi|
++------+
+Line 4 - not boxy at all
+Line 5 - not boxy at all
+Line 6 - not boxy at all
+Line 7 - not boxy at all
++------+
+| Lo|
++------+"#;
+
+        let lines: Vec<String> = input.lines().map(String::from).collect();
+        let console = Console::new();
+        let styles = make_test_styles();
+
+        // Process only lines 1-3 (first diagram, 1-indexed)
+        let mut config = make_test_config();
+        config.lines = Some(vec![LineRange { start: 1, end: 3 }]);
+        config.all_blocks = true; // Force processing
+
+        let (output, stats) = correct_lines(lines.clone(), &config, &console, &styles);
+
+        // Debug output
+        for (i, line) in output.iter().enumerate() {
+            eprintln!("output[{}]: {:?}", i, line);
+        }
+        eprintln!("stats: found={}, modified={}", stats.blocks_found, stats.blocks_modified);
+
+        // First diagram should be corrected (line index 1, which is 0-indexed line 1)
+        // The correction adds padding to align right border with the +------+ line
+        assert!(
+            output[1].contains("| Hi") && output[1].ends_with("|"),
+            "Expected first diagram to be corrected with right border, got: {:?}",
+            output[1]
+        );
+        // Second diagram should be unchanged (outside range) - line 8 (0-indexed)
+        assert!(
+            output[8].contains("| Lo|"),
+            "Expected second diagram unchanged, got: {:?}",
+            output[8]
+        );
+        // Should have found 2 blocks but only modified 1
+        assert_eq!(stats.blocks_found, 2, "Should find 2 diagram blocks");
+        assert_eq!(stats.blocks_modified, 1, "Should only modify 1 block");
     }
 }
