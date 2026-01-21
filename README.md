@@ -364,6 +364,25 @@ cat diagram.txt | aadc -i  # Wrong: no file to edit
 
 ---
 
+## Performance: Quick Passthrough
+
+For pipeline efficiency, aadc performs a quick scan before full processing:
+
+- If less than 1% of lines contain box-drawing characters, the input passes through unchanged
+- This makes piping large text files through aadc essentially free
+- Use `--all` to force processing regardless of content
+
+```bash
+# Fast: essays, code, logs pass through instantly
+cat large_logfile.txt | aadc
+
+# Verbose shows the decision
+cat file.txt | aadc -v
+
+# Force processing
+cat ambiguous.txt | aadc --all
+```
+
 ## Limitations
 
 - **Right borders only:** Currently only aligns right-side borders. Left alignment is assumed correct.

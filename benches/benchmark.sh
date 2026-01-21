@@ -14,7 +14,12 @@ echo ""
 # Build release binary
 echo "[1/4] Building release binary..."
 cargo build --release 2>/dev/null
-AADC="./target/release/aadc"
+
+# Get the target directory from cargo
+TARGET_DIR=$(cargo metadata --format-version 1 2>/dev/null | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('target_directory', 'target'))")
+AADC="${TARGET_DIR}/release/aadc"
+
+echo "Binary: $AADC"
 
 if ! command -v hyperfine &> /dev/null; then
     echo "Warning: hyperfine not installed. Using basic timing."

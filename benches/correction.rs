@@ -7,7 +7,7 @@
 //! For micro-benchmarks of internal functions, the code would need to be
 //! refactored to expose a library interface.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::process::Command;
 
 /// Benchmark processing a small ASCII diagram file

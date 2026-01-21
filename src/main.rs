@@ -287,6 +287,53 @@ struct Stats {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Quick Scan (Passthrough Optimization)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Minimum fraction of lines that must contain box-drawing chars to run full processing.
+const QUICK_SCAN_THRESHOLD: f64 = 0.01; // 1%
+
+/// Maximum number of lines to scan when deciding whether to process.
+const QUICK_SCAN_LIMIT: usize = 1000;
+
+/// Summary of a quick scan decision for diagram detection.
+#[derive(Debug)]
+struct QuickScanResult {
+    lines_scanned: usize,
+    lines_with_box_chars: usize,
+    ratio: f64,
+    likely_has_diagrams: bool,
+}
+
+/// Quickly scan input lines to decide whether full processing is necessary.
+fn quick_scan_for_diagrams(lines: &[String]) -> QuickScanResult {
+    let mut lines_scanned = 0;
+    let mut lines_with_box_chars = 0;
+
+    for line in lines.iter().take(QUICK_SCAN_LIMIT) {
+        lines_scanned += 1;
+        if line.chars().any(is_box_char) {
+            lines_with_box_chars += 1;
+        }
+    }
+
+    let ratio = if lines_scanned > 0 {
+        lines_with_box_chars as f64 / lines_scanned as f64
+    } else {
+        0.0
+    };
+
+    let likely_has_diagrams = ratio >= QUICK_SCAN_THRESHOLD;
+
+    QuickScanResult {
+        lines_scanned,
+        lines_with_box_chars,
+        ratio,
+        likely_has_diagrams,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // JSON Output Structures
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -986,6 +1033,23 @@ fn expand_tabs(line: &str, tab_width: usize) -> String {
 /// Main correction entry point
 fn correct_lines(lines: Vec<String>, config: &Config, console: &Console) -> (Vec<String>, Stats) {
     let mut stats = Stats::default();
+
+    if !config.all_blocks {
+        let scan = quick_scan_for_diagrams(&lines);
+        if !scan.likely_has_diagrams {
+            if config.verbose {
+                console.print(&format!(
+                    "[dim]Quick scan: no diagrams detected ({}/{} lines, {:.1}% box chars < {:.1}% threshold)[/]",
+                    scan.lines_with_box_chars,
+                    scan.lines_scanned,
+                    scan.ratio * 100.0,
+                    QUICK_SCAN_THRESHOLD * 100.0
+                ));
+                console.print("[dim]Passing through unchanged (use --all to force processing)[/]");
+            }
+            return (lines, stats);
+        }
+    }
 
     // Expand tabs
     let mut lines: Vec<String> = lines
@@ -1872,6 +1936,101 @@ mod tests {
         assert!(json.contains("\"status\":\"dry_run\""));
         // Content should not appear when None
         assert!(!json.contains("\"content\""));
+    }
+
+    // =========================================================================
+    // Quick scan passthrough tests
+    // =========================================================================
+
+    #[test]
+    fn test_quick_scan_plain_text() {
+        let lines = vec![
+            "Hello world".to_string(),
+            "This is plain text".to_string(),
+            "No diagrams here".to_string(),
+        ];
+        let result = quick_scan_for_diagrams(&lines);
+
+        assert!(!result.likely_has_diagrams);
+        assert_eq!(result.lines_with_box_chars, 0);
+    }
+
+    #[test]
+    fn test_quick_scan_with_diagram_lines() {
+        let lines = vec![
+            "+---+".to_string(),
+            "| a |".to_string(),
+            "+---+".to_string(),
+        ];
+        let result = quick_scan_for_diagrams(&lines);
+
+        assert!(result.likely_has_diagrams);
+        assert!(result.ratio >= QUICK_SCAN_THRESHOLD);
+    }
+
+    #[test]
+    fn test_quick_scan_threshold_boundary() {
+        let mut lines = Vec::new();
+        for i in 0..100 {
+            if i == 0 {
+                lines.push("+---+".to_string());
+            } else {
+                lines.push("plain text".to_string());
+            }
+        }
+        let result = quick_scan_for_diagrams(&lines);
+
+        assert_eq!(result.lines_scanned, 100);
+        assert_eq!(result.lines_with_box_chars, 1);
+        assert!(result.ratio >= QUICK_SCAN_THRESHOLD);
+        assert!(result.likely_has_diagrams);
+    }
+
+    #[test]
+    fn test_correct_lines_passthrough_skips_tabs() {
+        let lines = vec!["\tPlain text".to_string()];
+        let config = Config {
+            max_iters: 10,
+            min_score: 0.5,
+            preset: None,
+            tab_width: 4,
+            all_blocks: false,
+            verbose: false,
+            diff: false,
+            dry_run: false,
+            backup: false,
+            backup_ext: ".bak".to_string(),
+            json: false,
+        };
+        let console = Console::new();
+        let (corrected, stats) = correct_lines(lines.clone(), &config, &console);
+
+        assert_eq!(corrected, lines);
+        assert_eq!(stats.blocks_found, 0);
+        assert_eq!(stats.total_revisions, 0);
+    }
+
+    #[test]
+    fn test_correct_lines_all_blocks_bypasses_quick_scan() {
+        let lines = vec!["\tPlain text".to_string()];
+        let config = Config {
+            max_iters: 10,
+            min_score: 0.5,
+            preset: None,
+            tab_width: 4,
+            all_blocks: true,
+            verbose: false,
+            diff: false,
+            dry_run: false,
+            backup: false,
+            backup_ext: ".bak".to_string(),
+            json: false,
+        };
+        let console = Console::new();
+        let (corrected, _stats) = correct_lines(lines.clone(), &config, &console);
+
+        assert_ne!(corrected, lines);
+        assert_eq!(corrected[0], "    Plain text");
     }
 
     // =========================================================================
