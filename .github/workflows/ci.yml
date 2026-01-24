@@ -59,10 +59,8 @@ jobs:
         run: cargo build
 
       - name: Run unit tests
-        run: cargo test --verbose
-
-      - name: Run doc tests
-        run: cargo test --doc
+        # Use single thread to avoid mutex poisoning from tests that change cwd
+        run: cargo test --verbose -- --test-threads=1
 
   coverage:
     name: Coverage
