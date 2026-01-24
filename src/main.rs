@@ -53,7 +53,6 @@ use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rich_rust::terminal;
 use rich_rust::{ColorSystem, Console};
 use serde::{Deserialize, Serialize};
@@ -62,9 +61,6 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -459,6 +455,7 @@ enum HookAction {
 
 /// Runtime configuration derived from CLI args
 #[derive(Debug)]
+#[allow(dead_code)] // watch and debounce_ms reserved for future watch mode
 struct Config {
     max_iters: usize,
     min_score: f64,
@@ -2962,6 +2959,8 @@ mod tests {
             color: ColorMode::Auto,
             diff: false,
             dry_run: false,
+            watch: false,
+            debounce_ms: 500,
             backup: false,
             backup_ext: ".bak".to_string(),
             json: false,
@@ -2986,6 +2985,8 @@ mod tests {
             verbose: false,
             diff: false,
             dry_run: false,
+            watch: false,
+            debounce_ms: 500,
             backup: false,
             backup_ext: ".bak".to_string(),
             json: false,
@@ -3136,6 +3137,8 @@ mod tests {
             verbose: false,
             diff: false,
             dry_run: false,
+            watch: false,
+            debounce_ms: 500,
             backup: false,
             backup_ext: ".bak".to_string(),
             json: false,
@@ -3160,6 +3163,8 @@ mod tests {
             verbose: false,
             diff: false,
             dry_run: false,
+            watch: false,
+            debounce_ms: 500,
             backup: false,
             backup_ext: ".bak".to_string(),
             json: false,
