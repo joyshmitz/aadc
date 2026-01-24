@@ -23,6 +23,13 @@ macro_rules! test_log {
 }
 
 fn get_binary_path() -> PathBuf {
+    if let Ok(bin_path) = std::env::var("CARGO_BIN_EXE_aadc") {
+        let path = PathBuf::from(bin_path);
+        if path.exists() {
+            return path;
+        }
+    }
+
     // Try release first, then debug
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let release_path = PathBuf::from(manifest_dir).join("target/release/aadc");
