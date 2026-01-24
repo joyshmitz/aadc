@@ -55,6 +55,9 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      - name: Build binary for integration tests
+        run: cargo build
+
       - name: Run unit tests
         run: cargo test --verbose
 
