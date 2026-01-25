@@ -105,13 +105,22 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: List artifacts
+      - name: Generate combined SHA256SUMS
         run: |
+          cd dist
           echo "=== Release artifacts ==="
-          ls -la dist/
+          ls -la
           echo ""
-          echo "=== Checksums ==="
-          cat dist/*.sha256
+          # Combine all individual checksums into SHA256SUMS
+          cat *.sha256 > SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Copy install script
+        run: |
+          cp install.sh dist/
+          cd dist
+          sha256sum install.sh >> SHA256SUMS
 
       - name: Extract version
         id: version
@@ -130,7 +139,26 @@ jobs:
           cat << 'EOF' > release_notes.md
           ## Installation
 
-          ### Quick Install (Unix)
+          ### One-Line Install (Recommended)
+
+          ```bash
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh?$(date +%s)" | bash
+          ```
+
+          This auto-detects your platform and installs to `~/.local/bin`. Options:
+
+          ```bash
+          # Install to /usr/local/bin (requires sudo)
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash -s -- --system
+
+          # Auto-update PATH in shell rc files
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash -s -- --easy-mode
+
+          # Install this specific version
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash -s -- --version ${{ steps.version.outputs.tag }}
+          ```
+
+          ### Manual Download
 
           ```bash
           # Linux (amd64)
@@ -154,7 +182,7 @@ jobs:
           sudo mv aadc /usr/local/bin/
           ```
 
-          ### From Source
+          ### Via Cargo
 
           ```bash
           cargo install aadc
@@ -164,10 +192,16 @@ jobs:
 
           ### Verify Checksums
 
-          All binaries include SHA256 checksums. Verify with:
+          All binaries include SHA256 checksums. Download your platform's `.sha256` file and verify:
 
           ```bash
+          # Linux
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/aadc-linux-amd64.tar.xz.sha256
           sha256sum -c aadc-linux-amd64.tar.xz.sha256
+
+          # macOS
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/aadc-darwin-arm64.tar.xz.sha256
+          shasum -a 256 -c aadc-darwin-arm64.tar.xz.sha256
           ```
 
           ## What's Changed

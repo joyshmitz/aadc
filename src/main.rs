@@ -57,10 +57,13 @@ use rich_rust::terminal;
 use rich_rust::{ColorSystem, Console};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2561,6 +2564,126 @@ fn output_diff(result: &FileResult, proposed: bool) -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Watch Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Watch a file for changes and auto-correct on each save
+fn watch_and_correct(
+    path: &Path,
+    config: &Config,
+    console: &Console,
+    styles: &VerboseStyle,
+) -> Result<RunOutcome> {
+    // Validate that the file exists and is readable
+    if !path.exists() {
+        anyhow::bail!("File not found: {}", path.display());
+    }
+    if !path.is_file() {
+        anyhow::bail!("--watch requires a file, not a directory: {}", path.display());
+    }
+
+    // Set up Ctrl+C handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .context("Failed to set Ctrl+C handler")?;
+
+    // Set up file watcher
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        },
+        notify::Config::default(),
+    )
+    .context("Failed to create file watcher")?;
+
+    watcher
+        .watch(path, RecursiveMode::NonRecursive)
+        .with_context(|| format!("Failed to watch file: {}", path.display()))?;
+
+    let debounce = Duration::from_millis(config.debounce_ms);
+    let mut last_event = Instant::now() - debounce; // Allow immediate first run
+
+    eprintln!(
+        "Watching {} for changes (Ctrl+C to stop)...",
+        path.display()
+    );
+
+    let mut any_changes = false;
+
+    while running.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                // Only process file modification events
+                if matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_)
+                ) {
+                    let now = Instant::now();
+                    if now.duration_since(last_event) >= debounce {
+                        last_event = now;
+
+                        // Re-read and process the file
+                        match read_file(path) {
+                            Ok(lines) => {
+                                let result = process_input(
+                                    lines,
+                                    path.display().to_string(),
+                                    config,
+                                    console,
+                                    styles,
+                                );
+
+                                if result.would_change {
+                                    // Write the corrected content back
+                                    let output = result.corrected.join("\n");
+                                    match fs::write(path, &output) {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "✓ Applied {} revision(s)",
+                                                result.stats.total_revisions
+                                            );
+                                            any_changes = true;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("✗ Failed to write: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("✓ No changes needed");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("✗ Error reading file: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Just continue waiting
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Watcher disconnected, exit
+                break;
+            }
+        }
+    }
+
+    eprintln!("\nWatch mode stopped.");
+
+    Ok(RunOutcome {
+        dry_run: false,
+        would_change: any_changes,
+    })
+}
+
 fn run(args: Args) -> Result<RunOutcome> {
     validate_args(&args)?;
 
@@ -2574,6 +2697,15 @@ fn run(args: Args) -> Result<RunOutcome> {
 
     let config = create_config(&args)?;
     let (console, styles) = build_console(config.color);
+
+    // Handle watch mode - must have exactly one file input
+    if config.watch {
+        if args.inputs.len() != 1 {
+            anyhow::bail!("--watch requires exactly one input file");
+        }
+        let path = &args.inputs[0];
+        return watch_and_correct(path, &config, &console, &styles);
+    }
 
     if config.verbose {
         if let Some(preset) = config.preset {
@@ -2938,6 +3070,12 @@ mod tests {
     /// These tests cannot run in parallel because std::env::set_current_dir
     /// affects global process state.
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire CWD_LOCK, recovering from poisoned state if a previous test panicked.
+    /// This prevents cascading test failures when one test holding the lock panics.
+    fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+        CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn make_args() -> Args {
         Args {
@@ -4792,7 +4930,7 @@ mod tests {
 
     #[test]
     fn test_find_git_dir_not_in_repo() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4816,7 +4954,7 @@ mod tests {
 
     #[test]
     fn test_find_git_dir_in_repo() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4838,7 +4976,7 @@ mod tests {
 
     #[test]
     fn test_hook_install_creates_hook() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4874,7 +5012,7 @@ mod tests {
 
     #[test]
     fn test_hook_install_autofix_mode() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4900,7 +5038,7 @@ mod tests {
 
     #[test]
     fn test_hook_install_custom_patterns() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4926,7 +5064,7 @@ mod tests {
 
     #[test]
     fn test_hook_install_backs_up_existing() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4961,7 +5099,7 @@ mod tests {
 
     #[test]
     fn test_hook_uninstall_removes_aadc_hook() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -4987,7 +5125,7 @@ mod tests {
 
     #[test]
     fn test_hook_uninstall_refuses_non_aadc_hook() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();
@@ -5021,7 +5159,7 @@ mod tests {
 
     #[test]
     fn test_hook_status_no_hook() {
-        let _guard = CWD_LOCK.lock().unwrap();
+        let _guard = acquire_cwd_lock();
 
         // Save current dir
         let original_dir = std::env::current_dir().unwrap();

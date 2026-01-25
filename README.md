@@ -50,9 +50,22 @@ BEFORE                          AFTER
 
 **The Solution:** `aadc` automatically detects ASCII diagram blocks and aligns their right borders by adding padding—never removing content.
 
-**Install & Run:**
+<h3>Quick Install</h3>
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/aadc/main/install.sh?$(date +%s)" | bash
+```
+
+**Or via Cargo:**
+
 ```bash
 cargo install aadc
+```
+
+<p><em>Works on Linux and macOS. Auto-detects your platform and downloads the right binary.</em></p>
+
+**Then run:**
+```bash
 cat diagram.txt | aadc > fixed.txt
 ```
 
@@ -222,7 +235,34 @@ Unicode: ┬ ┴ ├ ┤ ┼ ╦ ╩ ╠ ╣ ╬ ╤ ╧ ╟ ╢ ╫ ╪
 
 ## Installation
 
-### From Source (Recommended)
+### Quick Install (Recommended)
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/aadc/main/install.sh?$(date +%s)" | bash
+```
+
+**Options:**
+```bash
+# Install to /usr/local/bin (requires sudo)
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/aadc/main/install.sh | bash -s -- --system
+
+# Auto-update PATH in shell rc files
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/aadc/main/install.sh | bash -s -- --easy-mode
+
+# Install specific version
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/aadc/main/install.sh | bash -s -- --version v0.1.0
+
+# Build from source instead of downloading binary
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/aadc/main/install.sh | bash -s -- --from-source
+```
+
+### Via Cargo
+
+```bash
+cargo install aadc
+```
+
+### From Source
 
 ```bash
 git clone https://github.com/Dicklesworthstone/aadc
