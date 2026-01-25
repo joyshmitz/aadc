@@ -10,3 +10,6 @@ rustc-ice-*.txt
 sweep_*.png
 test_screenshot.png
 a.out
+
+# Rust build directory (when building locally)
+/target/
