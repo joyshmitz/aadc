@@ -311,6 +311,8 @@ aadc [OPTIONS] [FILE]
 | `--verbose` | `-v` | false | Show correction progress |
 | `--diff` | `-d` | false | Show unified diff instead of full output |
 | `--dry-run` | `-n` | false | Preview changes without modifying files (exit 3 if changes would be made) |
+| `--watch` | `-w` | false | Watch file for changes and auto-correct |
+| `--debounce-ms` |  | 500 | Debounce interval in milliseconds (for `--watch` mode) |
 | `--backup` |  | false | Create backup file before in-place editing (requires `--in-place`) |
 | `--backup-ext` |  | `.bak` | Extension for backup files (requires `--backup`) |
 | `--json` |  | false | Output results as JSON (conflicts with `--verbose`/`--diff`) |
@@ -376,6 +378,23 @@ aadc -r --max-depth 2 docs/
 # Include gitignored files
 aadc -r --no-gitignore vendor/
 ```
+
+### Watch Mode
+
+Automatically re-correct files when they change:
+
+```bash
+# Start watching a file
+aadc --watch diagram.txt
+
+# With custom debounce (default 500ms)
+aadc --watch --debounce-ms 1000 diagram.txt
+
+# Watch with verbose output
+aadc -v --watch diagram.txt
+```
+
+Watch mode is ideal for iterative diagram editing workflows. Press Ctrl+C to stop watching.
 
 ---
 
