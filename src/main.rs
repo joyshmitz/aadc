@@ -3091,6 +3091,52 @@ mod tests {
         CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// RAII guard for safely saving and restoring the working directory in tests.
+    /// On macOS CI (GitHub Actions), the original working directory may not be
+    /// accessible (deleted or permission issues), causing `std::env::current_dir()`
+    /// to fail. This struct handles that case by using a temp directory as fallback.
+    struct SafeOriginalDir {
+        /// The path to restore to when dropped. Either the real original dir
+        /// or a temp directory if the original was inaccessible.
+        restore_path: std::path::PathBuf,
+        /// If we had to create a fallback temp dir, keep it alive here.
+        /// When this is dropped, the temp dir is cleaned up.
+        _fallback_temp: Option<tempfile::TempDir>,
+    }
+
+    impl SafeOriginalDir {
+        /// Create a new SafeOriginalDir, capturing the current directory or
+        /// creating a temp directory as fallback if current_dir() fails.
+        fn new() -> Self {
+            match std::env::current_dir() {
+                Ok(path) => SafeOriginalDir {
+                    restore_path: path,
+                    _fallback_temp: None,
+                },
+                Err(_) => {
+                    // Current dir is inaccessible (common on macOS CI).
+                    // Create a temp directory as our fallback restore point.
+                    let temp = tempfile::tempdir().expect("Failed to create fallback temp dir");
+                    let path = temp.path().to_path_buf();
+                    SafeOriginalDir {
+                        restore_path: path,
+                        _fallback_temp: Some(temp),
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for SafeOriginalDir {
+        fn drop(&mut self) {
+            // Attempt to restore the working directory. Ignore errors since:
+            // 1. The test's temp dir might have been cleaned up already
+            // 2. The original dir might still be inaccessible
+            // 3. We're in cleanup - not much we can do about failures
+            let _ = std::env::set_current_dir(&self.restore_path);
+        }
+    }
+
     fn make_args() -> Args {
         Args {
             inputs: vec![],
@@ -4961,9 +5007,7 @@ mod tests {
     #[test]
     fn test_find_git_dir_not_in_repo() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir that's not a git repo
         let temp = tempfile::tempdir().unwrap();
@@ -4977,17 +5021,13 @@ mod tests {
                 .to_string()
                 .contains("Not in a git repository")
         );
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_find_git_dir_in_repo() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git
         let temp = tempfile::tempdir().unwrap();
@@ -4999,17 +5039,13 @@ mod tests {
         let result = find_git_dir();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), git_dir);
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_install_creates_hook() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git/hooks
         let temp = tempfile::tempdir().unwrap();
@@ -5035,17 +5071,13 @@ mod tests {
             let perms = fs::metadata(&hook_path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o755, 0o755);
         }
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_install_autofix_mode() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git
         let temp = tempfile::tempdir().unwrap();
@@ -5061,17 +5093,13 @@ mod tests {
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(content.contains("# aadc pre-commit hook (auto-fix mode)"));
         assert!(content.contains("aadc -i"));
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_install_custom_patterns() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git
         let temp = tempfile::tempdir().unwrap();
@@ -5087,17 +5115,13 @@ mod tests {
         let hook_path = git_dir.join("hooks").join("pre-commit");
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(content.contains("*.rs *.go"));
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_install_backs_up_existing() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git/hooks and existing hook
         let temp = tempfile::tempdir().unwrap();
@@ -5122,17 +5146,13 @@ mod tests {
         // Verify new hook was installed
         let content = fs::read_to_string(&existing_hook).unwrap();
         assert!(content.contains("# aadc pre-commit hook"));
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_uninstall_removes_aadc_hook() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git/hooks and aadc hook
         let temp = tempfile::tempdir().unwrap();
@@ -5148,17 +5168,13 @@ mod tests {
         let result = hook_uninstall();
         assert!(result.is_ok());
         assert!(!hook_path.exists());
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_uninstall_refuses_non_aadc_hook() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git/hooks and non-aadc hook
         let temp = tempfile::tempdir().unwrap();
@@ -5182,17 +5198,13 @@ mod tests {
 
         // Hook should still exist
         assert!(hook_path.exists());
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
     fn test_hook_status_no_hook() {
         let _guard = acquire_cwd_lock();
-
-        // Save current dir
-        let original_dir = std::env::current_dir().unwrap();
+        let _restore = SafeOriginalDir::new();
 
         // Create a temp dir with .git but no hooks
         let temp = tempfile::tempdir().unwrap();
@@ -5204,9 +5216,7 @@ mod tests {
         // hook_status should succeed even with no hook
         let result = hook_status();
         assert!(result.is_ok());
-
-        // Restore
-        std::env::set_current_dir(original_dir).unwrap();
+        // SafeOriginalDir restores cwd on drop
     }
 
     #[test]
