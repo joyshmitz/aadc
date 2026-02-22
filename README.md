@@ -19,7 +19,7 @@
   <a href="https://github.com/Dicklesworthstone/aadc/actions/workflows/ci.yml"><img src="https://github.com/Dicklesworthstone/aadc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://codecov.io/gh/Dicklesworthstone/aadc"><img src="https://codecov.io/gh/Dicklesworthstone/aadc/branch/main/graph/badge.svg" alt="Coverage"></a>
   <a href="https://crates.io/crates/aadc"><img src="https://img.shields.io/crates/v/aadc.svg" alt="Crates.io"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License: MIT+Rider"></a>
 </p>
 
 <div align="center">
@@ -604,4 +604,4 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
