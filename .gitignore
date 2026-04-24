@@ -1,6 +1,17 @@
 # bv (beads viewer) local config and caches
 .bv/
 
+# Beads ephemeral runtime files (history snapshots, advisory locks, transient metadata)
+.beads/.br_history/
+.beads/last-touched
+.beads/.bv.lock
+.beads/*.lock
+
+# Multi-agent coordination scratch state
+.ntm/
+.swarm/
+.swarm_marching_orders.md
+
 # Ephemeral/temporary files (agent workflow artifacts)
 RESEARCH_FINDINGS.md
 TOON_INTEGRATION_BRIEF.md
