@@ -739,8 +739,49 @@ fn load_config_file(path: &Path) -> Result<FileConfig> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-    toml::from_str(&content)
-        .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    let parsed: FileConfig = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    validate_file_config(&parsed, path)?;
+    Ok(parsed)
+}
+
+/// Reject obviously-invalid file-config values *before* they are merged
+/// into the runtime [`Config`]. This mirrors `validate_args`, which only
+/// runs on the CLI side; without it, a config file containing
+/// `tab_width = 0` slips past the CLI gate at `validate_args` and lands
+/// directly in `expand_tabs`, where the modular-arithmetic
+/// `tab_width - (col % tab_width)` then panics with a divide-by-zero.
+/// Out-of-range `min_score` and `max_iters = 0` are silent rather than
+/// fatal, but they likewise produce surprising behavior (every revision
+/// auto-rejected/auto-accepted, or zero correction passes), so we
+/// reject them at the same surface for symmetry with the CLI rules.
+fn validate_file_config(file_config: &FileConfig, path: &Path) -> Result<()> {
+    let location = || path.display().to_string();
+    if let Some(score) = file_config.min_score {
+        if !(0.0..=1.0).contains(&score) {
+            return Err(anyhow::anyhow!(
+                "{}: min_score must be between 0.0 and 1.0, got {score}",
+                location()
+            ));
+        }
+    }
+    if let Some(iters) = file_config.max_iters {
+        if iters == 0 {
+            return Err(anyhow::anyhow!(
+                "{}: max_iters must be at least 1",
+                location()
+            ));
+        }
+    }
+    if let Some(width) = file_config.tab_width {
+        if width == 0 || width > 16 {
+            return Err(anyhow::anyhow!(
+                "{}: tab_width must be between 1 and 16, got {width}",
+                location()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Create Config by merging file config with CLI args (CLI wins)
@@ -3079,6 +3120,82 @@ fn output_multiple_results(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // File-config validation
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Helper: write `content` to a fresh tempfile and return the path
+    /// guard. Using `fs::write` instead of the `Write` trait sidesteps a
+    /// `clippy::unused_imports` false positive that complained about the
+    /// macro-only `use std::io::Write as _;` on Rust 2024.
+    fn write_temp_config(content: &str) -> tempfile::NamedTempFile {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), content).expect("write");
+        tmp
+    }
+
+    /// Regression: a config file with `tab_width = 0` used to slip past
+    /// the CLI gate (which only runs on `Args`) and land in
+    /// `expand_tabs`, where the modular-arithmetic
+    /// `tab_width - (col % tab_width)` panicked with divide-by-zero.
+    /// The error path now returns a clean parse error instead.
+    #[test]
+    fn config_file_rejects_zero_tab_width() {
+        let tmp = write_temp_config("tab_width = 0\n");
+        let err = load_config_file(tmp.path()).expect_err("zero tab_width must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tab_width must be between 1 and 16"),
+            "expected tab_width validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_oversized_tab_width() {
+        let tmp = write_temp_config("tab_width = 99\n");
+        let err = load_config_file(tmp.path()).expect_err("oversized tab_width must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tab_width must be between 1 and 16"),
+            "expected tab_width validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_zero_max_iters() {
+        let tmp = write_temp_config("max_iters = 0\n");
+        let err = load_config_file(tmp.path()).expect_err("max_iters=0 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_iters must be at least 1"),
+            "expected max_iters validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_min_score_out_of_range() {
+        for bad in ["-0.1", "1.5", "100.0"] {
+            let tmp = write_temp_config(&format!("min_score = {bad}\n"));
+            let err =
+                load_config_file(tmp.path()).expect_err("out-of-range min_score must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("min_score must be between 0.0 and 1.0"),
+                "expected min_score validation error for {bad}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_file_accepts_valid_values() {
+        // Sanity check: valid values round-trip cleanly.
+        let tmp = write_temp_config("tab_width = 8\nmax_iters = 25\nmin_score = 0.65\n");
+        let cfg = load_config_file(tmp.path()).expect("valid config must parse");
+        assert_eq!(cfg.tab_width, Some(8));
+        assert_eq!(cfg.max_iters, Some(25));
+        assert_eq!(cfg.min_score, Some(0.65));
+    }
 
     /// Mutex to serialize tests that change the current working directory.
     /// These tests cannot run in parallel because std::env::set_current_dir
